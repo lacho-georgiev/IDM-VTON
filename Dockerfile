@@ -51,7 +51,7 @@ RUN cd IDM-VTON && \
 WORKDIR /app/IDM-VTON
 
 # Create a script to run uvicorn
-RUN echo '#!/bin/bash\n. /app/IDM-VTON/venv/bin/activate\nexec uvicorn app:app --host 0.0.0.0 --port 7860' > /app/IDM-VTON/start_uvicorn.sh
+RUN echo '#!/bin/bash\n. /app/IDM-VTON/venv/bin/activate\nexec uvicorn app_VTON:app --host 0.0.0.0 --port 7860' > /app/IDM-VTON/start_uvicorn.sh
 RUN chmod +x /app/IDM-VTON/start_uvicorn.sh
 
 # Expose port for FastAPI
