@@ -102,8 +102,8 @@ async def startup_event():
         if load_mode == '4bit':
             quantize_4bit(UNet_Encoder)
 
-        UNet_Encoder requires_grad_(False)
-        image_encoder requires_grad_(False)
+        UNet_Encoder.requires_grad_(False)
+        image_encoder.requires_grad_(False)
         vae.requires_grad_(False)
         unet.requires_grad_(False)
 
