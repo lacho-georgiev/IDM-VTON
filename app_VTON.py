@@ -26,7 +26,7 @@ from util.pipeline import quantize_4bit, restart_cpu_offload, torch_gc
 app = FastAPI()
 
 load_mode = os.getenv('LOAD_MODE', None)
-fixed_vae = os.getenv('FIXED_VAE', True)
+fixed_vae = os.getenv('FIXED_VAE', 'True') == 'True'
 
 dtype = torch.float16
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -38,7 +38,7 @@ dtypeQuantize = dtype
 if load_mode in ('4bit', '8bit'):
     dtypeQuantize = torch.float8_e4m3fn
 
-ENABLE_CPU_OFFLOAD = os.getenv('LOW_VRAM', False)
+ENABLE_CPU_OFFLOAD = os.getenv('LOW_VRAM', 'False') == 'True'
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.allow_tf32 = False
 need_restart_cpu_offloading = False
