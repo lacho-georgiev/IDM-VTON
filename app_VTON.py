@@ -1,4 +1,3 @@
-import argparse
 import os
 import torch
 from PIL import Image
@@ -26,18 +25,11 @@ from util.pipeline import quantize_4bit, restart_cpu_offload, torch_gc
 
 app = FastAPI()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--share", type=str, default=False, help="Set to True to share the app publicly.")
-parser.add_argument("--lowvram", action="store_true", help="Enable CPU offload for model operations.")
-parser.add_argument("--load_mode", default=None, type=str, choices=["4bit", "8bit"], help="Quantization mode for optimization memory consumption")
-parser.add_argument("--fixed_vae", action="store_true", default=True, help="Use fixed vae for FP16.")
-args = parser.parse_args()
-
-load_mode = args.load_mode
-fixed_vae = args.fixed_vae
+load_mode = os.getenv('LOAD_MODE', None)
+fixed_vae = os.getenv('FIXED_VAE', True)
 
 dtype = torch.float16
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model_id = 'yisol/IDM-VTON'
 vae_model_id = 'madebyollin/sdxl-vae-fp16-fix'
 
@@ -46,7 +38,7 @@ dtypeQuantize = dtype
 if load_mode in ('4bit', '8bit'):
     dtypeQuantize = torch.float8_e4m3fn
 
-ENABLE_CPU_OFFLOAD = args.lowvram
+ENABLE_CPU_OFFLOAD = os.getenv('LOW_VRAM', False)
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.allow_tf32 = False
 need_restart_cpu_offloading = False

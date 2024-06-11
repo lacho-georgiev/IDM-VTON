@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     git \
     wget \
     build-essential \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,7 +33,7 @@ RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.d
 WORKDIR /app
 
 # Clone the IDM-VTON repository
-RUN git clone -b serverless https://github.com/lacho-georgiev/IDM-VTON
+RUN git clone -b main https://github.com/lacho-georgiev/IDM-VTON
 
 # Set up the virtual environment and install dependencies
 RUN cd IDM-VTON && \
@@ -45,8 +47,15 @@ RUN cd IDM-VTON && \
     pip install bitsandbytes==0.43.0 --upgrade && \
     pip install fastapi uvicorn
 
+# Set the working directory to the cloned repo
+WORKDIR /app/IDM-VTON
+
+# Create a script to run uvicorn
+RUN echo '#!/bin/bash\n. /app/IDM-VTON/venv/bin/activate\nexec uvicorn app:app --host 0.0.0.0 --port 7860' > /app/IDM-VTON/start_uvicorn.sh
+RUN chmod +x /app/IDM-VTON/start_uvicorn.sh
+
 # Expose port for FastAPI
 EXPOSE 7860
 
 # Command to run the application
-CMD ["sh", "-c", ". /app/IDM-VTON/venv/bin/activate && uvicorn app_VTON:app --host 0.0.0.0 --port 7860"]
+CMD ["/app/IDM-VTON/start_uvicorn.sh"]
