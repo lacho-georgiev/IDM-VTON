@@ -3,10 +3,12 @@ import os
 import io
 import base64
 import torch
-from PIL import Image
+from PIL import Image, ExifTags
 from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
 from src.unet_hacked_tryon import UNet2DConditionModel
@@ -73,6 +75,26 @@ unet = None
 pipe = None
 UNet_Encoder = None
 example_path = os.path.join(os.path.dirname(__file__), 'example')
+
+
+# Function to correct image orientation based on EXIF metadata
+def correct_image_orientation(image: Image) -> Image:
+    try:
+        for orientation in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation] == 'Orientation':
+                break
+        exif = image._getexif()
+        if exif is not None:
+            orientation = exif.get(orientation, 1)
+            if orientation == 3:
+                image = image.rotate(180, expand=True)
+            elif orientation == 6:
+                image = image.rotate(270, expand=True)
+            elif orientation == 8:
+                image = image.rotate(90, expand=True)
+    except Exception as e:
+        logger.error(f"Error correcting image orientation: {e}")
+    return image
 
 
 @app.on_event("startup")
@@ -146,22 +168,85 @@ async def load_models():
 
 def image_to_base64(img: Image) -> str:
     buffered = io.BytesIO()
+    img = img.convert("RGB")  # Convert to RGB before saving as JPEG
     img.save(buffered, format="JPEG")
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return img_str
 
 
-def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_crop, denoise_steps, is_randomize_seed,
-                seed, number_of_images, prompt):  # Add prompt parameter
+def process_image(model_img: Image, category: str):
+    human_img = model_img.resize((768, 1024))
+    parsing_model = Parsing(0)
+    openpose_model = OpenPose(0)
+    openpose_model.preprocessor.body_estimation.model.to(device)
+    tensor_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ])
+
+    keypoints = openpose_model(human_img.resize((384, 512)))
+    model_parse, _ = parsing_model(human_img.resize((384, 512)))
+    mask, mask_gray = get_mask_location('hd', category, model_parse, keypoints)
+    mask = mask.resize((768, 1024))
+
+    mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transform(human_img)
+    mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
+
+    human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
+    human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
+
+    args = apply_net.create_argument_parser().parse_args(
+        ('show', './configs/densepose_rcnn_R_50_FPN_s1x.yaml', './ckpt/densepose/model_final_162be9.pkl', 'dp_segm',
+         '-v', '--opts', 'MODEL.DEVICE', 'cuda')
+    )
+    pose_img = args.func(args, human_img_arg)
+    pose_img = pose_img[:, :, ::-1]
+    pose_img = Image.fromarray(pose_img).resize((768, 1024))
+
+    # Convert images to base64
+    mask_base64 = image_to_base64(mask)
+    pose_img_base64 = image_to_base64(pose_img)
+    model_img_base64 = image_to_base64(model_img)
+
+    return {
+        "mask_base64": mask_base64,
+        "pose_img_base64": pose_img_base64,
+        "model_img_base64": model_img_base64
+    }
+
+@app.post("/process_mask_pose")
+async def process_mask_pose(
+        model_image: UploadFile = File(...)
+):
+    try:
+        logger.info("Received mask and pose processing request")
+        model_img = Image.open(io.BytesIO(await model_image.read()))
+
+        # Correct orientation for the image
+        model_img = correct_image_orientation(model_img)
+
+        categories = ["upper_body", "lower_body", "dresses"]
+        results = {}
+
+        for category in categories:
+            logger.info(f"Processing category: {category}")
+            results[category] = process_image(model_img, category)
+
+        return JSONResponse(content=results)
+
+    except Exception as e:
+        logger.error(f"Exception during mask and pose processing: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+def start_tryon(mask_img: Image, pose_img: Image, model_img: Image, garm_img: Image, garment_des: str, category: str,
+                is_checked: bool, is_checked_crop: bool, denoise_steps: int, is_randomize_seed: bool, seed: int,
+                number_of_images: int, prompt: str):  # Add prompt parameter
     global pipe, unet, UNet_Encoder, need_restart_cpu_offloading
 
     logger.info("Starting tryon process")
     start_time = time.time()
 
     torch_gc()
-    parsing_model = Parsing(0)
-    openpose_model = OpenPose(0)
-    openpose_model.preprocessor.body_estimation.model.to(device)
     tensor_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
@@ -173,8 +258,9 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         pipe.enable_model_cpu_offload()
 
     garm_img = garm_img.convert("RGB").resize((768, 1024))
-    human_img_orig = dict["background"].convert("RGB")
+    human_img_orig = model_img.convert("RGB")
 
+    step_start_time = time.time()
     if is_checked_crop:
         width, height = human_img_orig.size
         target_width = int(min(width, height * (3 / 4)))
@@ -188,34 +274,15 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         human_img = cropped_img.resize((768, 1024))
     else:
         human_img = human_img_orig.resize((768, 1024))
+    logger.info(f"Image cropping and resizing completed in {time.time() - step_start_time:.2f}s")
 
-    if is_checked:
-        try:
-            mask_start = time.time()
-            keypoints = openpose_model(human_img.resize((384, 512)))
-            model_parse, _ = parsing_model(human_img.resize((384, 512)))
-            mask, mask_gray = get_mask_location('hd', category, model_parse, keypoints)
-            mask = mask.resize((768, 1024))
-            logger.info(f"Mask generation completed in {time.time() - mask_start:.2f}s")
-        except Exception as e:
-            logger.error(f"Error during mask generation: {e}")
-            return {"error": "Could not find a human in the photo."}, None
-    else:
-        mask = pil_to_binary_mask(dict['layers'][0].convert("RGB").resize((768, 1024)))
-
-    mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transform(human_img)
+    step_start_time = time.time()
+    mask_gray = (1 - transforms.ToTensor()(mask_img)) * tensor_transform(human_img)
     mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
 
     human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
-
-    args = apply_net.create_argument_parser().parse_args(
-        ('show', './configs/densepose_rcnn_R_50_FPN_s1x.yaml', './ckpt/densepose/model_final_162be9.pkl', 'dp_segm',
-        '-v', '--opts', 'MODEL.DEVICE', 'cuda')
-    )
-    pose_img = args.func(args, human_img_arg)
-    pose_img = pose_img[:, :, ::-1]
-    pose_img = Image.fromarray(pose_img).resize((768, 1024))
+    logger.info(f"Mask conversion and EXIF orientation correction completed in {time.time() - step_start_time:.2f}s")
 
     if pipe.text_encoder is not None:
         pipe.text_encoder.to(device)
@@ -288,7 +355,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             pose_img=pose_img.to(device, dtype),
                             text_embeds_cloth=prompt_embeds_c.to(device, dtype),
                             cloth=garm_tensor.to(device, dtype),
-                            mask_image=mask,
+                            mask_image=mask_img,
                             image=human_img,
                             height=1024,
                             width=768,
@@ -314,7 +381,9 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
 @app.post("/tryon")
 async def tryon(
         background_tasks: BackgroundTasks,
-        model_image: UploadFile = File(...),
+        mask_base64: str = Form(...),
+        pose_img_base64: str = Form(...),
+        model_img_base64: str = Form(...),
         garment_image: UploadFile = File(...),
         description: str = Form(""),
         category: str = Form("upper_body"),  # Add category parameter
@@ -329,27 +398,102 @@ async def tryon(
     request_start = time.time()
     try:
         logger.info("Received tryon request")
-        model_img = Image.open(io.BytesIO(await model_image.read()))
+        step_start_time = time.time()
+
+        # Decode base64 images
+        mask_img = Image.open(io.BytesIO(base64.b64decode(mask_base64)))
+        pose_img = Image.open(io.BytesIO(base64.b64decode(pose_img_base64)))
+        model_img = Image.open(io.BytesIO(base64.b64decode(model_img_base64)))
         garment_img = Image.open(io.BytesIO(await garment_image.read()))
+        logger.info(f"Image reading and decoding completed in {time.time() - step_start_time:.2f}s")
 
-        dict = {"background": model_img, "layers": [model_img]}  # Simplified example; adjust as needed
-
+        step_start_time = time.time()
         results, error = start_tryon(
-            dict, garment_img, description, category, is_checked, is_checked_crop, denoise_steps, is_randomize_seed,
+            mask_img, pose_img, model_img, garment_img, description, category, is_checked, is_checked_crop,
+            denoise_steps, is_randomize_seed,
             seed, number_of_images, prompt  # Pass new parameters
         )
+        logger.info(f"Tryon process completed in {time.time() - step_start_time:.2f}s")
 
         if error:
             logger.error(f"Error in tryon process: {error}")
             return JSONResponse(status_code=400, content={"error": error})
 
+        step_start_time = time.time()
         results_base64 = [image_to_base64(Image.open(img_path)) for img_path in results]
+        logger.info(f"Image encoding to base64 completed in {time.time() - step_start_time:.2f}s")
 
         logger.info(f"Request processed in {time.time() - request_start:.2f}s")
         return JSONResponse(content={"output_images": results_base64})
     except Exception as e:
         logger.error(f"Exception during tryon process: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/regenerate")
+async def regenerate(
+        background_tasks: BackgroundTasks,
+        model_image: UploadFile = File(...),
+        garment_image: UploadFile = File(...),
+        description: str = Form(""),
+        category: str = Form("upper_body"),  # Specify the category in the request
+        prompt: str = Form(""),  # Add prompt parameter
+        is_checked: bool = Form(True),
+        is_checked_crop: bool = Form(True),
+        denoise_steps: int = Form(30),
+        is_randomize_seed: bool = Form(True),
+        seed: int = Form(1),
+        number_of_images: int = Form(1)
+):
+    request_start = time.time()
+    try:
+        logger.info("Received regenerate request")
+        step_start_time = time.time()
+
+        # Step 1: Process and decode model image
+        model_img = Image.open(io.BytesIO(await model_image.read()))
+        model_img = correct_image_orientation(model_img)
+        garment_img = Image.open(io.BytesIO(await garment_image.read()))
+        logger.info(f"Image reading and decoding completed in {time.time() - step_start_time:.2f}s")
+
+        # Step 2: Generate mask and pose images only for the specified category
+        processed_images = process_image(model_img, category)
+        mask_img = Image.open(io.BytesIO(base64.b64decode(processed_images["mask_base64"])))
+        pose_img = Image.open(io.BytesIO(base64.b64decode(processed_images["pose_img_base64"])))
+
+        # Use model_img directly since it was already opened from the upload
+        model_img_processed = model_img
+
+        # Step 3: Perform tryon process
+        step_start_time = time.time()
+        results, error = start_tryon(
+            mask_img, pose_img, model_img_processed, garment_img, description, category, is_checked, is_checked_crop,
+            denoise_steps, is_randomize_seed, seed, number_of_images, prompt
+        )
+        logger.info(f"Tryon process completed in {time.time() - step_start_time:.2f}s")
+
+        if error:
+            logger.error(f"Error in tryon process: {error}")
+            return JSONResponse(status_code=400, content={"error": error})
+
+        # Step 4: Convert results to base64 and return
+        step_start_time = time.time()
+        results_base64 = [image_to_base64(Image.open(img_path)) for img_path in results]
+        logger.info(f"Image encoding to base64 completed in {time.time() - step_start_time:.2f}s")
+
+        # Include the mask and pose images in the response
+        mask_base64 = processed_images["mask_base64"]
+        pose_img_base64 = processed_images["pose_img_base64"]
+
+        logger.info(f"Request processed in {time.time() - request_start:.2f}s")
+        return JSONResponse(content={
+            "output_images": results_base64,
+            "mask_base64": mask_base64,
+            "pose_img_base64": pose_img_base64
+        })
+    except Exception as e:
+        logger.error(f"Exception during regenerate process: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 if __name__ == "__main__":

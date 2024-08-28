@@ -45,17 +45,18 @@ RUN cd IDM-VTON && \
     pip install torch==2.2.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --upgrade && \
     pip install xformers==0.0.24 && \
     pip install bitsandbytes==0.43.0 --upgrade && \
-    pip install fastapi uvicorn
+    pip install fastapi uvicorn && \
+    pip install transformers diffusers huggingface_hub
 
 # Set the working directory to the cloned repo
 WORKDIR /app/IDM-VTON
 
-# Create entrypoint script
-RUN echo '#!/bin/bash\nsource /app/IDM-VTON/venv/bin/activate\nexec uvicorn app_VTON:app --host 0.0.0.0 --port 7860' > /app/IDM-VTON/entrypoint.sh
-RUN chmod +x /app/IDM-VTON/entrypoint.sh
+# Copy handler function to the working directory
+COPY app_VTON.py /app/IDM-VTON/app_VTON.py
 
-# Expose port for FastAPI
-EXPOSE 7860
+# Create entrypoint script
+RUN echo '#!/bin/bash\nsource /app/IDM-VTON/venv/bin/activate\nexec uvicorn app_VTON:app --host 0.0.0.0 --port 8000' > /app/IDM-VTON/entrypoint.sh
+RUN chmod +x /app/IDM-VTON/entrypoint.sh
 
 # Command to run the application
 ENTRYPOINT ["/app/IDM-VTON/entrypoint.sh"]
