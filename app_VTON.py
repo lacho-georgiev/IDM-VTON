@@ -404,6 +404,10 @@ async def tryon(
         mask_img = Image.open(io.BytesIO(base64.b64decode(mask_base64)))
         pose_img = Image.open(io.BytesIO(base64.b64decode(pose_img_base64)))
         model_img = Image.open(io.BytesIO(base64.b64decode(model_img_base64)))
+
+        # Correct orientation for the model image
+        model_img = correct_image_orientation(model_img)
+
         garment_img = Image.open(io.BytesIO(await garment_image.read()))
         logger.info(f"Image reading and decoding completed in {time.time() - step_start_time:.2f}s")
 
